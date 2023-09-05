@@ -1,67 +1,128 @@
 package main
 
 import (
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"net/http"
 	"os"
+	"path"
+	"path/filepath"
 	"regexp"
+	"time"
 
 	"golang.org/x/sync/errgroup"
 )
 
-type CheckResult struct {
-	HTTPCode int
-	Referrer string
-	Error    error
-	Body     string
-	Recursed bool
-}
-
 var (
-	linksChecked map[string]*CheckResult
-	path         string
-	skipTLS      bool
-	timeout      int
+	file      string
+	dir       string
+	skipTLS   bool
+	timeout   int64
+	userAgent string
 )
 
 var markdownRegex = regexp.MustCompile(`\[[^][]+]\((https?://[^()]+)\)`)
 
-func handle(err error) {
-	if err != nil {
-		panic(err)
-	}
+var client = &http.Client{
+	Timeout: time.Duration(timeout) * time.Second,
 }
+
+const mdExt = ".md"
 
 func main() {
 
-	flag.StringVar(&path, "path", "", "path of markdown file")
-	flag.BoolVar(&skipTLS, "skiptls", false, "To try site with invalid certificate, default: false")
-	flag.IntVar(&timeout, "timeout", 5, "Timeout in seconds.")
+	flag.StringVar(&file, "file", "", "path of markdown file")
+	flag.StringVar(&dir, "dir", "", "path of dir containing markdown files")
+	flag.BoolVar(&skipTLS, "skip-tls", false, "ignore invalid TLS/SSL certificates (default false)")
+	flag.Int64Var(&timeout, "timeout", 5, "timeout in seconds")
+	flag.StringVar(&userAgent, "user-agent", "Mozilla/5.0 (X11; Linux x86_64; rv:102.0) Gecko/20100101 Firefox/102.0", "impersonate an agent")
 	flag.Parse()
 
-	bs, err := os.ReadFile(path)
-	handle(err)
+	if skipTLS {
+		client.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		}
+	}
 
+	var e error
+	if file != "" {
+		if err := checkFile(file); err != nil {
+			e = err
+		}
+	} else if dir != "" {
+		if err := checkDir(dir); err != nil {
+			e = err
+		}
+	} else {
+		flag.Usage()
+		e = fmt.Errorf("missing mandatory flags: use -file or -dir")
+	}
+
+	if e != nil {
+		fmt.Println("err:", e)
+		os.Exit(-1)
+	}
+}
+
+func checkFile(file string) error {
+
+	if path.Ext(file) != mdExt {
+		return fmt.Errorf("not a markdown file")
+	}
+
+	bs, err := os.ReadFile(file)
+	if err != nil {
+		return err
+	}
 	matches := markdownRegex.FindAllStringSubmatch(string(bs), -1)
+
 	g := errgroup.Group{}
 	g.SetLimit(-1)
-	for _, m := range matches {
 
-		link := m[1]
+	for len(matches) != 0 {
+
+		link := matches[0][1]
 
 		g.Go(func() error {
-			resp, err := http.Get(link)
+
+			req, err := http.NewRequest(http.MethodGet, link, nil)
 			if err != nil {
-				fmt.Println("broken link:", link)
+				return err
 			}
-			defer resp.Body.Close()
-			fmt.Println("reachable link:", link)
+
+			req.Header.Add("User-Agent", userAgent)
+
+			resp, err := client.Do(req)
+			if err != nil {
+				fmt.Printf("broken link: %q\n", link)
+			} else {
+				resp.Body.Close()
+				fmt.Printf("[%d]: %s\n", resp.StatusCode, link)
+			}
+
 			return nil
 		})
+
+		matches = matches[1:]
 	}
 
 	if err := g.Wait(); err != nil {
-		panic(err)
+		return err
 	}
+	return nil
+}
+
+func checkDir(dir string) error {
+	return filepath.Walk(dir, visit)
+}
+
+func visit(p string, info os.FileInfo, err error) error {
+	if err != nil {
+		return err
+	}
+	if path.Ext(p) == mdExt {
+		return checkFile(p)
+	}
+	return nil
 }

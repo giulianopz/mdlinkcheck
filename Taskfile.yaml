@@ -1,0 +1,16 @@
+version: '3'
+
+tasks:
+      
+  build:
+    cmds:
+      - go build -o mdlinkcheck .
+    
+  lint:
+    cmds:
+      - golangci-lint -v run
+
+  install:
+    cmds:
+      - mkdir -p ~/bin
+      - cp ./mdlinkcheck ~/bin
