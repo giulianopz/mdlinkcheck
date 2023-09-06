@@ -95,7 +95,7 @@ func checkFile(file string) error {
 
 			resp, err := client.Do(req)
 			if err != nil {
-				fmt.Printf("broken link: %q\n", link)
+				fmt.Printf("[err]: %q\n", link)
 			} else {
 				resp.Body.Close()
 				fmt.Printf("[%d]: %s\n", resp.StatusCode, link)
