@@ -2,7 +2,7 @@
 
 Simple cli tool to check links in a markdown file or in a directory of markdown files:
 ```bash
-$ go get github.com/giulianopz/mdlinkcheck@latest
+$ go install github.com/giulianopz/mdlinkcheck@latest
 
 $ mdlinkcheck -h
 Usage of mdlinkcheck:
@@ -16,4 +16,7 @@ Usage of mdlinkcheck:
         timeout in seconds (default 5)
   -user-agent string
         impersonate an agent (default "Mozilla/5.0 (X11; Linux x86_64; rv:102.0) Gecko/20100101 Firefox/102.0")
+
+$ mdlinkcheck --file file.md | grep -v 200 
+[err]: https://twitter.com
 ```
