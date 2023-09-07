@@ -1,22 +1,19 @@
 package main
 
 import (
-	"context"
 	"crypto/tls"
 	"flag"
 	"fmt"
-	"net"
 	"net/http"
 	"os"
 	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/sync/errgroup"
-
-	"github.com/rs/dnscache"
 )
 
 var (
@@ -26,19 +23,16 @@ var (
 	timeout   int64
 	userAgent string
 	method    string
+	follow    bool
 )
 
-var markdownRegex = regexp.MustCompile(`\[[^][]+]\((https?://[^()]+)\)`)
-
-const mdExt = ".md"
+var markdownLinkRgx = regexp.MustCompile(`\[[^][]+]\((https?://[^()]+)\)`)
 
 var client = &http.Client{
 	Timeout: time.Duration(timeout) * time.Second,
-	// do not follow redirects
-	CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		return http.ErrUseLastResponse
-	},
 }
+
+const mdExt = ".md"
 
 func main() {
 
@@ -46,53 +40,34 @@ func main() {
 	flag.StringVar(&dir, "dir", "", "path of dir containing markdown files")
 	flag.BoolVar(&skipTLS, "skip-tls", false, "ignore invalid TLS/SSL certificates (default false)")
 	flag.Int64Var(&timeout, "timeout", 5, "timeout in seconds")
+	flag.StringVar(&method, "http-method", http.MethodGet, "http method: HEAD (faster, less accurate) or GET (slower, trustworthy)")
 	flag.StringVar(&userAgent, "user-agent", "Mozilla/5.0 (X11; Linux x86_64; rv:102.0) Gecko/20100101 Firefox/102.0", "impersonate an agent")
-	flag.StringVar(&method, "http-method", http.MethodGet, "http verb: HEAD (faster, less accurate) or GET (slower, trustworthy)")
+	flag.BoolVar(&follow, "follow", true, "follow redirects")
 	flag.Parse()
 
-	r := &dnscache.Resolver{}
+	method = strings.ToUpper(method)
+	if method != http.MethodGet && method != http.MethodHead {
+		fmt.Println("err: --http-method must be HEAD or GET")
+		os.Exit(1)
+	}
 
 	t := &http.Transport{
 		// connection pooling params
 		MaxIdleConns:    100,
 		MaxConnsPerHost: 10,
 		IdleConnTimeout: 10 * time.Second,
-		// in-memory dns caching
-		DialContext: func(ctx context.Context, network string, addr string) (conn net.Conn, err error) {
-			host, port, err := net.SplitHostPort(addr)
-			if err != nil {
-				return nil, err
-			}
-			ips, err := r.LookupHost(ctx, host)
-			if err != nil {
-				return nil, err
-			}
-			for _, ip := range ips {
-				var dialer net.Dialer
-				conn, err = dialer.DialContext(ctx, network, net.JoinHostPort(ip, port))
-				if err == nil {
-					break
-				}
-			}
-			return
-		},
 	}
 
-	go func() {
-		t := time.NewTicker(5 * time.Minute)
-		defer t.Stop()
-
-		for range t.C {
-			options := dnscache.ResolverRefreshOptions{
-				ClearUnused:      true,
-				PersistOnFailure: true,
-			}
-			r.RefreshWithOptions(options)
+	if !follow {
+		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
 		}
-	}()
+	}
 
 	if skipTLS {
-		t.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+		client.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		}
 	}
 
 	client.Transport = t
@@ -123,45 +98,23 @@ func checkFile(file string) error {
 		return fmt.Errorf("not a markdown file")
 	}
 
-	if strings.ToUpper(method) != http.MethodHead && strings.ToUpper(method) != http.MethodGet {
-		return fmt.Errorf("http method must be HEAD or GET")
-	}
-
 	bs, err := os.ReadFile(file)
 	if err != nil {
 		return err
 	}
-	matches := markdownRegex.FindAllStringSubmatch(string(bs), -1)
+
+	links := extract(string(bs))
 
 	g := errgroup.Group{}
 	g.SetLimit(-1)
 
-	for len(matches) != 0 {
+	for len(links) != 0 {
 
-		link := matches[0][1]
-
+		link := links[0]
 		g.Go(func() error {
-
-			req, err := http.NewRequest(strings.ToUpper(method), link, nil)
-			if err != nil {
-				return err
-			}
-
-			req.Header.Add("User-Agent", userAgent)
-			req.Header.Add("Accept", "*/*")
-
-			resp, err := client.Do(req)
-			if err != nil {
-				fmt.Printf("[err]: %q\n", link)
-			} else {
-				fmt.Printf("[%d]: %s\n", resp.StatusCode, link)
-				defer resp.Body.Close()
-			}
-
-			return nil
+			return check(link)
 		})
-
-		matches = matches[1:]
+		link = link[1:]
 	}
 
 	if err := g.Wait(); err != nil {
@@ -171,15 +124,104 @@ func checkFile(file string) error {
 }
 
 func checkDir(dir string) error {
-	return filepath.Walk(dir, visit)
+
+	done := make(chan struct{}, 0)
+	defer close(done)
+
+	linksC, errC := getLinks(done, dir)
+
+	g := errgroup.Group{}
+	g.SetLimit(-1)
+
+	for link := range linksC {
+		link := link
+		g.Go(func() error {
+			return check(link)
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return err
+	}
+
+	if err := <-errC; err != nil {
+		return err
+	}
+
+	return nil
 }
 
-func visit(p string, info os.FileInfo, err error) error {
+func getLinks(done <-chan struct{}, root string) (<-chan string, <-chan error) {
+
+	linksC := make(chan string)
+	errC := make(chan error, 1)
+	go func() {
+		var wg sync.WaitGroup
+		err := filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if path.Ext(p) != mdExt {
+				return nil
+			}
+			wg.Add(1)
+			go func() {
+
+				bs, err := os.ReadFile(p)
+				if err != nil {
+					fmt.Println(err)
+				} else {
+					for _, l := range extract(string(bs)) {
+						select {
+						case linksC <- l:
+						case <-done:
+						}
+					}
+				}
+				wg.Done()
+			}()
+
+			select {
+			case <-done:
+				return fmt.Errorf("done")
+			default:
+				return nil
+			}
+		})
+
+		go func() {
+			wg.Wait()
+			close(linksC)
+		}()
+		errC <- err
+	}()
+	return linksC, errC
+}
+
+func extract(mdText string) []string {
+	links := make([]string, 0)
+	matches := markdownLinkRgx.FindAllStringSubmatch(mdText, -1)
+	for _, m := range matches {
+		links = append(links, m[1])
+	}
+	return links
+}
+
+func check(link string) error {
+	req, err := http.NewRequest(method, link, nil)
 	if err != nil {
 		return err
 	}
-	if path.Ext(p) == mdExt {
-		return checkFile(p)
+
+	req.Header.Add("User-Agent", userAgent)
+	req.Header.Add("Accept", "*/*")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Printf("[err]: %q\n", link)
+	} else {
+		resp.Body.Close()
+		fmt.Printf("[%d]: %s\n", resp.StatusCode, link)
 	}
 	return nil
 }
