@@ -125,7 +125,7 @@ func checkFile(file string) error {
 
 func checkDir(dir string) error {
 
-	done := make(chan struct{}, 0)
+	done := make(chan struct{})
 	defer close(done)
 
 	linksC, errC := getLinks(done, dir)
