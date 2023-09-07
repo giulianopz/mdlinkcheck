@@ -51,13 +51,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	t := &http.Transport{
-		// connection pooling params
-		MaxIdleConns:    100,
-		MaxConnsPerHost: 10,
-		IdleConnTimeout: 10 * time.Second,
-	}
-
 	if !follow {
 		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
@@ -69,8 +62,6 @@ func main() {
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		}
 	}
-
-	client.Transport = t
 
 	var e error
 	if file != "" {
